@@ -1,0 +1,122 @@
+@startuml
+participant "Controller\n(interface)" as API
+participant "Application Service\n(application)" as AppService
+participant "Processor 校验\n(application)" as processor
+participant "Assembler 转换器(cmd\qry\dto)\n(application)" as CommandAssembler
+participant "Domain Service\n(domain)" as DomainService
+participant "DTOAssembler\n(application)" as DTOAssembler
+participant "Domain Repository\n(domain)" as DomainRepository
+participant "Repository Persistence\n(infrastructure)" as Persistence
+participant "POConverter\n(infrastructure)" as poCon
+participant "Mapper\n(infrastructure)" as poMapper
+
+participant "EventPublisher" as EventPublisher
+
+title 通用请求处理流程
+
+API -> AppService : 调用服务方法 \n (传递 Command，简单校验使用validation注解)
+activate AppService
+alt 组装业务逻辑，有需要则开启事务
+    AppService -> processor : 复杂校验
+    processor --> AppService : 返回校验结果
+    AppService -> CommandAssembler : 转换 Command 到 Entity
+    CommandAssembler --> AppService : 返回 Entity
+
+    AppService-->AppService:获取锁操作
+    note right
+        genn-spring-boot-starter-lock
+            - redis: redissonLockExecutor
+            - 服务器本机: localLockExecutor
+            - 通用注解：@Lock 方法
+    end note
+
+    AppService-->AppService:缓存操作
+    note right
+        genn-spring-boot-starter-cache：指定 CacheClient：redis/caffeine
+            - @Cache
+            - @CacheEvict
+            - @CacheMultiEvict
+    end note
+
+
+    AppService -> DomainService : 执行领域操作（传递 Entity）
+
+    activate DomainService
+    DomainService->DomainService: 业务处理
+    DomainService -> DomainRepository : 调用持久化接口 (Repository)
+
+    alt 数据保存
+        DomainRepository -> Persistence : 数据库操作 (保存)
+        Persistence -> poCon: 领域对象转 po
+        poCon --> Persistence: 返回 po
+        Persistence -> poMapper: 数据落库
+        note right
+            genn-spring-boot-starter-database
+            多数据源
+                -
+            mybatis-plus 插件：入口-MybatisPlusInterceptor
+                - 分页插件：paginationInnerInterceptor
+                    - 前提：genn.database.mybatis-plus.enabled=true
+                - 租户插件：tenantLineInnerInterceptor
+                    - 前提：genn.database.mybatis-plus.enable-tenant-line=true
+                        - 忽略租户：
+                            - @IgnoreTenant(force=true)
+                            - genn.database.mybatis-plus.tenantIgnoreTables
+                - 动态表名插件：dynamicTableNameInnerInterceptor
+                    - 前提：BaseRequestContext.getAttachment("dynamicTableName", String.class)
+                - 元数据对象处理：MetaObjectHandler 子实现 InsertOrUpdateMetaObjectHandler
+                    - 插入、更新操作默认数据（创建/变更人、时间、租户）处理
+
+        end note
+        poMapper --> Persistence : 返回数据库结果
+        Persistence -> EventPublisher: 数据持久化后发布事件
+    end
+
+    alt 数据查询
+        DomainRepository -> Persistence : 数据库操作 (查询)
+        Persistence -> poMapper: 数据查询
+        poMapper --> Persistence : 返回数据库结果
+        Persistence -> poCon: po 转 领域对象
+        poCon --> Persistence: 返回 领域对象
+        Persistence --> DomainRepository: 返回领域对象
+    end
+    DomainRepository-->DomainService: 返回处理结果
+    DomainService -> EventPublisher: 领域事件发布，事务提交后可使用：TransactionalApplicationListenerSynchronization#afterCompletion
+
+    note right
+    相关依赖：
+    genn-core
+    genn-spring-boot-starter-event-spring
+
+    相关实现：
+    Event 继承自：SpringBaseEvent
+    SpringEventListener：
+        - 同步 SpringEventSyncListener
+        - 异步 SpringEventAsyncListener
+            - 线程池配置见 SpringEventAutoConfiguration#springEventAsyncExecutor
+
+
+    end note
+
+
+
+
+DomainService --> AppService : 返回领域结果
+
+end
+deactivate DomainService
+deactivate AppService
+AppService -> DTOAssembler : 转换 Entity 到 DTO
+DTOAssembler --> AppService : 返回 DTO
+AppService -> EventPublisher: 事务提交后发布事件
+
+AppService -> API : 返回结果（DTO）
+
+note right
+流程说明：
+
+后端开发规范见：
+https://qvmyfyf7txd.feishu.cn/wiki/XIsUwFCdbiMV4MkcziDcdqpAnhE?fromScene=spaceOverview
+end note
+
+@enduml
